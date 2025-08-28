@@ -1,105 +1,95 @@
-# =============================== #
-# Multimodal Housing Price Prediction
-# Using Tabular Data + Images
-# =============================== #
+"""
+RAG Engine without LangChain
+- Handles embedding, storage, retrieval, and Gemini response
+"""
 
-# ---- Install dependencies (only in Colab) ----
-# !pip install scikit-learn pandas tensorflow
-
-# ---- Imports ----
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error
-from tensorflow.keras.applications import ResNet50
-from tensorflow.keras.applications.resnet50 import preprocess_input
-from tensorflow.keras.preprocessing import image
-from tensorflow.keras.models import Model
 import os
+import tempfile
+import chromadb
+from chromadb.utils import embedding_functions
+from PyPDF2 import PdfReader
+import google.generativeai as genai
 
-# ===============================
-# STEP 1: Load CSV File
-# ===============================
-from google.colab import files
-uploaded_csv = files.upload()   # Upload your CSV
-csv_filename = list(uploaded_csv.keys())[0]
 
-data = pd.read_csv(csv_filename)
+# ----------------------
+# Gemini + Chroma Setup
+# ----------------------
 
-print("CSV Loaded ✅")
-print(data.head())
+class RAGChatbot:
+    def __init__(self, api_key, persist_dir="./chroma_store"):
+        self.api_key = api_key
+        self.persist_dir = persist_dir
 
-# ===============================
-# STEP 2: Upload Images
-# ===============================
-uploaded_images = files.upload()   # Upload multiple house images
+        # Init Google Gemini client
+        self.client = genai.Client(api_key=self.api_key)
 
-image_files = list(uploaded_images.keys())
-print("Images uploaded ✅", image_files[:5])
+        # Init embedding function (Google Embedding API)
+        self.embedding_fn = embedding_functions.GoogleGenerativeAiEmbeddingFunction(
+            model_name="models/embedding-001", api_key=self.api_key
+        )
 
-# ===============================
-# STEP 3: Pre-trained CNN for image features
-# ===============================
-cnn_model = ResNet50(weights="imagenet", include_top=False, pooling="avg")
+        # Init Chroma client
+        self.chroma_client = chromadb.PersistentClient(path=persist_dir)
 
-def extract_image_features(img_path, model):
-    img = image.load_img(img_path, target_size=(224, 224))
-    img_array = image.img_to_array(img)
-    img_array = np.expand_dims(img_array, axis=0)
-    img_array = preprocess_input(img_array)
-    features = model.predict(img_array, verbose=0)
-    return features.flatten()
+        # Create collection if not exists
+        self.collection = self.chroma_client.get_or_create_collection(
+            name="docs", embedding_function=self.embedding_fn
+        )
 
-# ===============================
-# STEP 4: Match Images with CSV Rows
-# ===============================
-image_features = []
-for idx in range(len(data)):
-    if idx < len(image_files):   # Assign by order
-        feats = extract_image_features(image_files[idx], cnn_model)
-    else:
-        feats = np.zeros(2048)  # Fallback if missing image
-    image_features.append(feats)
+        # Memory for conversation
+        self.chat_history = []
 
-image_features = np.array(image_features)
+    # ----------------------
+    # Document ingestion
+    # ----------------------
+    def add_text(self, text, doc_id):
+        self.collection.add(documents=[text], ids=[doc_id])
 
-print("Extracted Image Features ✅", image_features.shape)
+    def add_pdf(self, file_path):
+        pdf = PdfReader(file_path)
+        text = ""
+        for page in pdf.pages:
+            text += page.extract_text() + "\n"
+        self.add_text(text, doc_id=os.path.basename(file_path))
 
-# ===============================
-# STEP 5: Prepare Tabular Data
-# ===============================
-# Target = price
-y = data["price"].values  
+    # ----------------------
+    # Query with RAG
+    # ----------------------
+    def query(self, user_query, top_k=3):
+        # Retrieve top-k docs
+        results = self.collection.query(query_texts=[user_query], n_results=top_k)
+        retrieved_docs = results["documents"][0]
 
-# Drop non-numeric columns
-X_tab = data.drop(columns=["price"])
-X_tab = pd.get_dummies(X_tab, drop_first=True)  # Encode categorical
+        # Build context
+        context = "\n\n".join(retrieved_docs)
 
-# Normalize
-scaler = StandardScaler()
-X_tab_scaled = scaler.fit_transform(X_tab)
+        # Conversation history
+        history = "\n".join([f"{role}: {msg}" for role, msg in self.chat_history])
 
-print("Tabular Features ✅", X_tab_scaled.shape)
+        # Prompt
+        prompt = f"""
+You are a helpful AI assistant.
+Conversation so far:
+{history}
 
-# ===============================
-# STEP 6: Combine Tabular + Image Features
-# ===============================
-X_final = np.hstack([X_tab_scaled, image_features])
-print("Final Shape:", X_final.shape)
+Relevant context:
+{context}
 
-# ===============================
-# STEP 7: Train & Evaluate Model
-# ===============================
-X_train, X_test, y_train, y_test = train_test_split(
-    X_final, y, test_size=0.2, random_state=42
-)
+User question: {user_query}
 
-model = LinearRegression()
-model.fit(X_train, y_train)
+Answer in a helpful and concise way.
+"""
 
-y_pred = model.predict(X_test)
+        # Call Gemini
+        response = self.client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=prompt
+        )
 
-print("Model Training ✅")
-print("MSE:", mean_squared_error(y_test, y_pred))
+        answer = response.candidates[0].content.parts[0].text
+
+        # Save chat history
+        self.chat_history.append(("User", user_query))
+        self.chat_history.append(("Bot", answer))
+
+        return answer
