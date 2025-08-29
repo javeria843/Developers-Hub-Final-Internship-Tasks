@@ -121,3 +121,6 @@ LLM deployment with Streamlit
 Model export for production
 
 Clean, modular ML code
+<img width="1334" height="612" alt="image" src="https://github.com/user-attachments/assets/f5409650-7409-4293-8374-8342ba870783" />
+
+
